@@ -1,0 +1,135 @@
+# Databricks notebook source
+from pyspark.sql import *
+from pyspark.sql.functions import *
+import pyspark.sql.functions as f
+from pyspark.sql.types import *
+from pyspark.sql.window import Window
+from delta import *
+
+# COMMAND ----------
+
+class TransactionalUpsert_CustomizedPartitioning: 
+  def __init__(self, 
+               transaction_id_columns: str,
+               transaction_partition_creation_logic: str,
+               source_path: str,
+               update_dataframe: DataFrame = None,
+               provided_file_path_flag: bool = False
+              ):
+    """
+    Initiating the TransactionalUpsert object
+    
+    Args:
+      transaction_id_columns: list of columns creating transaction id 
+      transaction_partition_creation_logic: The logic to create the partition values
+      source_path: the path to the initial delta table that we're aiming to update
+      update_dataframe: dataframe that would be updating the source delta table
+      provided_file_path_flag: determines whether the file path for the row content is provided in the dataframe
+    """
+    
+    self.transaction_id_columns = transaction_id_columns.split(',')
+    self.transaction_partition_creation_logic = transaction_partition_creation_logic
+    self.source_path = source_path
+    if('__input_file_name' not in update_dataframe.columns):
+      self.update_dataframe = update_dataframe.withColumn('__input_file_name', lit(None).cast(StringType()))
+    else:
+      self.update_dataframe = update_dataframe
+    #if __input_file_name column is provided externally, it should not be part of data content (mostly applicable to excrypted xml ingestion)
+    self.content_key_columns = sorted([column_name for column_name in self.update_dataframe.columns if column_name != '__input_file_name'], key = lambda element : element.lower())
+    self.provided_file_path_flag = provided_file_path_flag
+    
+    # making sure source delta table exists or creating it.
+    try:
+      self.source_dataframe = (spark.read
+                               .format('delta')
+                               .load(self.source_path)
+                              )
+    except Exception as ex:
+      if("is not a Delta table." in str(ex)):
+        #if __input_file_name column is provided externally, it should not be part of data content (mostly applicable to excrypted xml ingestion)
+        default_schema = self.update_dataframe.drop('__input_file_name').schema
+        self.source_dataframe = (spark
+                                 .createDataFrame([], schema = default_schema)
+                                 .withColumn('__transaction_id_hash', lit(None).cast(StringType()))
+                                 .withColumn('__transaction_partition_value', lit(None).cast(StringType()))
+                                 .withColumn('__process_date_time', lit(None).cast(TimestampType()))
+                                )
+        self.source_dataframe.write.format('delta').partitionBy('__transaction_partition_value').save(self.source_path)
+  
+  def _add_helper_columns_to_update(self):
+    """ Stage one preparation on current table before merge. Adding SCD_COLS to other herlper functions to aid table preparations. 
+    Deduplicates table on content key hash where duplicates exist within the same '__bronze_landing_date_time'.
+    Also identifies which record should have the current flag enabled.
+        
+    """    
+    data_columns = self.content_key_columns + ['__transaction_id_hash', '__transaction_partition_value', '__process_date_time']
+
+    deduplication_window = Window.partitionBy('__transaction_id_hash').orderBy(col('__bronze_landing_date_time').desc())
+
+    self.update_dataframe = (self.update_dataframe
+                             .withColumn('__input_file_name', when(lit(self.provided_file_path_flag), col('__input_file_name')).otherwise(input_file_name())) 
+                             .withColumn('__bronze_landing_date_time', to_timestamp(regexp_replace(regexp_extract(col('__input_file_name'), '([0-9]{8}[/_][0-9]{6})', 1), '_', '/'), 'yyyyMMdd/HHmmss'))
+                             
+                             .withColumn('__transaction_id_hash', sha2(concat_ws('|', *self.transaction_id_columns), 256))
+                             
+                             .withColumn('__bronze_landing_date_time_row_number', row_number().over(deduplication_window))
+                             .where(col('__bronze_landing_date_time_row_number') == 1)
+                             
+                             .withColumn('__transaction_partition_value', expr(transaction_partition_creation_logic).cast(StringType()))
+                             .withColumn('__process_date_time', lit(datetime.datetime.now()))
+                             
+                             .select(*data_columns)
+                             .cache())
+    
+    self.new_records_count = self.update_dataframe.count()
+    print("number of new record contents: " + str(self.new_records_count))
+    
+    return True
+  
+  def transactional_upsert_merge(self):
+    self._add_helper_columns_to_update()
+    
+    if(self.new_records_count != 0):
+      source_dataframe = DeltaTable.forPath(spark, self.source_path)
+      updating_partitions_string = ','.join(["\'" + rowObject['__transaction_partition_value'] + "\'" for rowObject in self.update_dataframe.select(col('__transaction_partition_value').cast(StringType()).alias('__transaction_partition_value')).distinct().collect()])
+
+      (source_dataframe.alias("original")
+       .merge(source = self.update_dataframe.alias("update"), 
+              condition = expr("original.__transaction_id_hash = update.__transaction_id_hash AND original.__transaction_partition_value in ({})".format(updating_partitions_string)))
+       .whenMatchedUpdateAll()
+       .whenNotMatchedInsertAll()
+       .execute())
+
+      self.update_dataframe.unpersist()
+    
+    return True
+    
+  def get_delta_change_data_feed_log(self, 
+                                     version: int = None):
+    """ View counts on change events after merge operation. This function should be called after the merge operation.
+    Returns information about the number of updated rows, number of deleted rows, number of inserted rows and number of affected rows.
+    
+    Args:
+        version: delta table version
+        
+    Returns: change feed dataframe containing quantitative data about merge operation
+    """
+    delta = DeltaTable.forPath(spark, self.source_path)
+    delta_version = (delta
+                     .history()
+                     .where(col('operation') == 'MERGE')
+                     .orderBy(col('version').desc()).collect()[0].version)
+
+    change_log = (delta
+                  .history()
+                  .where(col('version') == coalesce(lit(version), lit(delta_version)))
+                  .withColumn('version', col('version'))
+                  .withColumn('change_timestamp', col('timestamp'))
+                  .withColumn('operation', col('operation'))
+                  .withColumn('execution_time_in_ms', col('operationMetrics.executionTimeMs'))
+                  .withColumn('num_deleted_rows', col('operationMetrics.numTargetRowsDeleted'))
+                  .withColumn('num_updated_rows', col('operationMetrics.numTargetRowsUpdated'))
+                  .withColumn('num_inserted_rows', col('operationMetrics.numTargetRowsInserted'))
+                  .select('version', 'change_timestamp', 'operation', 'execution_time_in_ms', 'num_deleted_rows', 'num_updated_rows', 'num_inserted_rows'))
+
+    return change_log

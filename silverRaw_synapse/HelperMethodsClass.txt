@@ -1,0 +1,193 @@
+# Databricks notebook source
+from pyspark.sql import *
+from pyspark.sql.functions import *
+from pyspark.sql.types import *
+from pyspark.sql.window import Window
+from delta import *
+import datetime, re
+from functools import reduce
+
+# COMMAND ----------
+
+class HelperMethods():
+  
+  def __init__(self, 
+               storage_account_name: str,
+               source_raw_folder_paths: list,
+               process_start_datetime: datetime.datetime = None, 
+               process_end_datetime: datetime.datetime = None,
+               business_key_columns: list = None,
+               type_i_columns_list: list = None
+              ):
+    self.storage_account_name = storage_account_name
+    self.source_raw_folder_paths = source_raw_folder_paths
+    self.process_start_datetime = process_start_datetime
+    self.process_end_datetime = process_end_datetime
+#     self.source_id_mapping = {
+#       'ForthillsStaffed': 'ForthillsStaffed',
+#       'FortHillsAHS': 'FortHillsAHS',
+#       'BaseMineAHS': 'BaseMineAHS',
+#       'BaseMineAHS2': 'BaseMineAHS2',
+#       'BaseMineStaffed': 'BaseMineStaffed'
+#     }
+    self.process_datetime = datetime.datetime.now()
+    
+    #Values to be set at the top of the methods that are generating those tables.
+    if(business_key_columns is not None):
+      self._business_key_columns = business_key_columns
+    else:
+      self._business_key_columns = []
+      
+    if(type_i_columns_list is not None):
+      self._type_i_columns_list = type_i_columns_list
+    else:
+      self._type_i_columns_list = []
+    
+    #Setting up configurations for write-out to delta process
+    spark.conf.set('spark.databricks.delta.properties.defaults.autoOptimize.optimizeWrite', 'true')
+    spark.conf.set('spark.databricks.delta.properties.defaults.autoOptimize.autoCompact', 'true')
+
+    
+  def _get_data_column_list(self, dataframe_column_list: list):
+    """
+    Returns a list of colums whose names don't start with __ thus are data columns.
+    """
+    return [column_name for column_name in dataframe_column_list if not column_name.startswith('__')]
+
+  def _column_name_list_sort(self, column_name_list):
+    """
+    Retruns a sorted list of column names based on column names in lower case
+    """
+    return sorted(column_name_list, key = lambda element : element.lower())
+  
+  def _unioning_dataframe_list(self, df_list: list):
+    """
+    Unions a list of datarames. Used for reading the same table of data from multiple mines at once.
+    """
+    return reduce(DataFrame.unionByName, df_list)
+  
+  
+  def _initial_data_read_and_source_id_inference(self, source_address: str):
+    """
+    Reading data from a single mine source and adding its SourceId column to it.
+    """
+#     source_id = [self.source_id_mapping[element] for element in self.source_id_mapping.keys() if '/' + element + '/' in source_address][0]
+    df = (spark.read.format('delta').load(source_address)
+#           .withColumn('SourceId', lit(source_id))
+         )
+    
+    return df
+  
+  
+  def _source_data_lake_address_list_generator(self, raw_folder_paths: list, table_name: str):
+    """
+    Generates a list of silver-raw paths to read delta tables from.
+    """
+    return [f'abfss://silver-raw@{self.storage_account_name}.dfs.core.windows.net/{element}/{table_name}' for element in raw_folder_paths]
+
+  
+  def _select_data_columns(self, df):
+    """
+    Selecting data column i.e. columns whose names don't start with __.
+    """
+    return df.select(*self._get_data_column_list(df.columns))
+  
+  
+  def _data_read(self, raw_folder_paths: list, table_name: str, data_read_type: str, list_of_partition_values: list = None):
+    """
+    Reading data from a list of raw_folder_paths in silver-raw.
+    If the read mode is regular_incremental, the table is filtered on __process_datetime column which is the timestamp of the records landing in silver-raw layer.
+    type_i_incremental_join_right_side data read mode is used for reading right side of left joins to improve the performance. 
+    Essentially, the partitions with data to contribute to the joins are identified and only those partitions are read. 
+    raw_folder_paths is a list, so data from multiple sources (mines) can be read at once. Of course, raw_folder_paths can have one element and read data from a single source.
+    .trasnform pyspark transformation applies a function to the dataframe.
+    """
+    source_addresses = self._source_data_lake_address_list_generator(raw_folder_paths, table_name)
+    
+    df_list = []
+    for source_address in source_addresses:
+      df = self._initial_data_read_and_source_id_inference(source_address)
+      
+      if(data_read_type == 'regular_incremental'):
+        process_datetime_column = '__process_date_time' if '__process_date_time' in df.columns else '__process_datetime'
+        if('__current' in df.columns):
+          df_list.append(df
+                       .where((col(process_datetime_column) >= self.process_start_datetime) &
+                              (col(process_datetime_column) < self.process_end_datetime) &
+                              (col('__current'))
+                             )
+                       .transform(self._select_data_columns)
+                      )
+        else:
+          df_list.append(df
+                         .where((col(process_datetime_column) >= self.process_start_datetime) &
+                                (col(process_datetime_column) < self.process_end_datetime)
+                               )
+                         .transform(self._select_data_columns)
+                        )
+        
+      elif(data_read_type == 'type_i_incremental_join_right_side'):
+        df_list.append(df
+                       .where(col('__transaction_partition_value').isin(list_of_partition_values))
+                       .transform(self._select_data_columns)
+                      )
+        
+      elif(data_read_type == 'type_ii_incremental_join_right_side'):
+        df_list.append(df
+                       .where(col('__current'))
+                       .transform(self._select_data_columns)
+                      )
+      elif(data_read_type == 'type_i_full_load'):
+        df_list.append(df)
+      
+      else:
+        raise ValueError('Incorrect Data Read Type!')
+      
+    return self._unioning_dataframe_list(df_list)
+  
+  
+  def _cache(self, df):
+    """
+    caching dataframes and running an action on them to solidify the cache.
+    """
+    df.cache()
+    print(f'caching {df.count()} records.')
+    
+    return True
+  
+  
+  def _list_of_right_side_partitions_finder(self, df, list_of_columns: list):
+    """
+    Needs to be discussed!
+    Finding the list of the partition values that are applicable to the right side of the join in which df is the left side.
+    Multiple columns on the left side of the join can be targetted in the join, so the output is a dictionary whose keys are column names from the left side of the join and values are lists of applicable partition values on the silver-raw tables of right side of the join.
+    Joins in the cases that we have right now are happening on ids. the silver-raw tables are partitioned on the first 4 digits of ids, and that explains the substring function.
+    """
+    distinct_values_dictionary = {}
+    for column_name in list_of_columns:
+      distinct_values_dictionary[column_name] = [element['value'] for element in df.select(substring(col(column_name).cast(StringType()), 1, 4).alias('value')).where(col('value').isNotNull()).distinct().collect()]
+      
+    return distinct_values_dictionary
+  
+  def add_dim_audit_columns(self, df):
+    """
+    Adding audit columns that are used in dim tables
+    """
+    return (df
+            .withColumn('__BusinessKeyHash', sha2(concat_ws('|', *[col(column).cast(StringType()) for column in self._column_name_list_sort(self._business_key_columns)]), 256).cast(BinaryType()))
+            .withColumn('__Type1Hash', sha2(concat_ws('|', *[col(column).cast(StringType()) for column in  self._column_name_list_sort(self._type_i_columns_list)]), 256).cast(BinaryType())) #explicitly determined
+            .withColumn('__Type2Hash', sha2(concat_ws('|', *[col(column).cast(StringType()) for column in  self._column_name_list_sort(set(df.columns) - set(self._type_i_columns_list))]), 256).cast(BinaryType())) #all columns except typeI, business key and audit columns
+            .withColumn('__DeletedFlag', lit(False))
+            .withColumn('__CreateDateTime', lit(datetime.datetime.now()))
+           )
+    
+  def add_fact_audit_columns(self, df):
+    """
+    Adding audit columns that are used in fact tables
+    """
+    #This Comment Is Added To Trigger Deployment.
+    return (df
+            .withColumn('__FactKeyHash', sha2(concat_ws('|', *[col(column).cast(StringType()) for column in self._column_name_list_sort(self._business_key_columns)]), 256).cast(BinaryType()))
+            .withColumn('__DeletedFlag', lit(False))
+            .withColumn('__CreateDateTime', lit(datetime.datetime.now()))
+           )
